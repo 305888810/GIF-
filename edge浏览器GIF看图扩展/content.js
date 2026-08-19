@@ -3,18 +3,43 @@
 
   const ANIMATED_IMAGE_RE = /(?:\.(?:gif|webp)(?:[?#].*)?$|[/?](?:gif|webp)(?:[/?#]|$)|(?:format|fm|type)=(?:gif|webp)|image\/(?:gif|webp))/i;
   const IS_HUABAN = /(^|\.)huaban\.com$/i.test(location.hostname);
-  const RAW_CACHE_LIMIT = 50 * 1024 * 1024;
-  const DECODED_CACHE_LIMIT = 150 * 1024 * 1024;
+  const DEFAULT_SETTINGS = { enabled: true, siteMode: "block", siteList: [], language: "auto", cacheItems: 1, cacheSizeMB: 150 };
+  const messages = {
+    zh: { viewerLabel:"GIF / WebP 逐帧预览",first:"第一帧",previous:"上一帧",playPause:"播放 / 暂停",next:"下一帧",last:"最后一帧",loading:"读取中…",timeline:"播放进度",loop:"循环",speed:"速度",frame:"帧",decodeFailed:"无法拆分",unknownError:"未知错误",unknownType:"未知图片类型",noDecoder:"当前 Edge 未提供 ImageDecoder",noFrames:"GIF 没有可显示的帧",invalidData:"后台返回了无效的图片数据",readFailed:"读取图片失败",cancelled:"预加载已取消" },
+    en: { viewerLabel:"GIF / WebP frame viewer",first:"First frame",previous:"Previous frame",playPause:"Play / pause",next:"Next frame",last:"Last frame",loading:"Loading…",timeline:"Playback timeline",loop:"Loop",speed:"Speed",frame:"Frame",decodeFailed:"Cannot decode",unknownError:"Unknown error",unknownType:"Unknown image type",noDecoder:"ImageDecoder is unavailable in this Edge version",noFrames:"The GIF has no displayable frames",invalidData:"The extension returned invalid image data",readFailed:"Unable to read image",cancelled:"Preload cancelled" }
+  };
+  let settings = { ...DEFAULT_SETTINGS };
+  let monitoring = false;
+  let mutationObserver = null;
+  let routeFallbackTimer = null;
   const attached = new WeakSet();
+  const viewers = new Set();
   const resourceCache = new Map();
   let activeViewer = null;
   let huabanViewer = null;
   let huabanScanTimer = null;
   let currentPinId = null;
   let preloadHandle = null;
+  let preloadIsIdle = false;
   let gifWorker = null;
   let gifWorkerRequestId = 0;
   const gifWorkerRequests = new Map();
+
+  function normalizeSettings(value) {
+    return { enabled:value.enabled !== false, siteMode:value.siteMode === "allow" ? "allow" : "block", siteList:Array.isArray(value.siteList) ? value.siteList.filter((item) => typeof item === "string") : [], language:["auto","zh","en"].includes(value.language) ? value.language : "auto", cacheItems:[1,2,3].includes(Number(value.cacheItems)) ? Number(value.cacheItems) : 1, cacheSizeMB:[64,150,256,512].includes(Number(value.cacheSizeMB)) ? Number(value.cacheSizeMB) : 150 };
+  }
+  function currentLanguage() {
+    if (settings.language !== "auto") return settings.language;
+    return /^zh\b/i.test(chrome.i18n?.getUILanguage?.() || navigator.language || "en") ? "zh" : "en";
+  }
+  function tr(key) { return messages[currentLanguage()][key] || messages.en[key] || key; }
+  function domainMatches(host, rule) { const normalized=rule.toLowerCase().replace(/^www\./,""); return host === normalized || host.endsWith(`.${normalized}`); }
+  function isSiteAllowed() {
+    if (!settings.enabled) return false;
+    const host=location.protocol === "file:" ? "file://" : location.hostname.toLowerCase().replace(/^www\./,"");
+    const listed=settings.siteList.some((rule)=>domainMatches(host,rule));
+    return settings.siteMode === "block" ? !listed : listed;
+  }
 
   function isAnimatedCandidate(img) {
     if (!(img instanceof HTMLImageElement)) return false;
@@ -23,6 +48,7 @@
   }
 
   function scan(root = document) {
+    if (!monitoring || !isSiteAllowed()) return;
     if (IS_HUABAN) {
       scheduleHuabanScan();
       return;
@@ -32,7 +58,11 @@
       if (attached.has(img)) return;
       if (isAnimatedCandidate(img)) attachViewer(img);
       else {
+        if (img.dataset.gifProbeBound) return;
+        img.dataset.gifProbeBound = "1";
         img.addEventListener("mouseenter", () => {
+          delete img.dataset.gifProbeBound;
+          if (!monitoring || !isSiteAllowed()) return;
           if (img.dataset.gifProbeDone) return;
           img.dataset.gifProbeDone = "1";
           chrome.runtime.sendMessage({ type: "probe-image", url: img.currentSrc || img.src }, (result) => {
@@ -44,7 +74,7 @@
   }
 
   function scheduleHuabanScan() {
-    if (huabanScanTimer) return;
+    if (!monitoring || !isSiteAllowed() || huabanScanTimer) return;
     huabanScanTimer = requestAnimationFrame(() => {
       huabanScanTimer = null;
       const pinId = getPinId();
@@ -114,12 +144,18 @@
     if (preloadHandle) return;
     const run = () => {
       preloadHandle = null;
+      preloadIsIdle = false;
       if (getPinId() !== pinId || new URL(location.href).searchParams.has("modalImg")) return;
       const url = findHuabanPreloadUrl(pinId);
       if (url) preloadResource(pinId, url);
     };
-    if (typeof requestIdleCallback === "function") preloadHandle = requestIdleCallback(run, { timeout: 1200 });
-    else preloadHandle = setTimeout(run, 500);
+    if (typeof requestIdleCallback === "function") {
+      preloadIsIdle = true;
+      preloadHandle = requestIdleCallback(run, { timeout: 1200 });
+    } else {
+      preloadIsIdle = false;
+      preloadHandle = setTimeout(run, 500);
+    }
   }
 
   function findHuabanPreloadUrl(pinId) {
@@ -180,7 +216,7 @@
       entry.decodePromise = entry.blobPromise.then((blob) => decodeBlob(blob)).then((decoded) => {
         if (entry.cancelled) {
           disposeDecoded(decoded);
-          throw new Error("预加载已取消");
+          throw new Error(tr("cancelled"));
         }
         entry.decoded = decoded;
         entry.decodedBytes = estimateDecodedBytes(decoded);
@@ -204,10 +240,12 @@
 
   function enforceCacheLimits() {
     const entries = [...resourceCache.values()].sort((left, right) => left.lastUsed - right.lastUsed);
+    const rawCacheLimit = Math.min(50, settings.cacheSizeMB) * 1024 * 1024;
+    const decodedCacheLimit = settings.cacheSizeMB * 1024 * 1024;
     let rawBytes = entries.reduce((total, entry) => total + (entry.blob?.size || 0), 0);
     let rawCount = entries.filter((entry) => entry.blob).length;
     for (const entry of entries) {
-      if (rawBytes <= RAW_CACHE_LIMIT && rawCount <= 3) break;
+      if (rawBytes <= rawCacheLimit && rawCount <= settings.cacheItems) break;
       if (!entry.blob || entry.inUse) continue;
       rawBytes -= entry.blob.size;
       rawCount--;
@@ -217,7 +255,7 @@
     let decodedBytes = entries.reduce((total, entry) => total + entry.decodedBytes, 0);
     let decodedCount = entries.filter((entry) => entry.decoded).length;
     for (const entry of entries) {
-      if (decodedBytes <= DECODED_CACHE_LIMIT && decodedCount <= 1) break;
+      if (decodedBytes <= decodedCacheLimit && decodedCount <= settings.cacheItems) break;
       if (!entry.decoded || entry.inUse) continue;
       decodedBytes -= entry.decodedBytes;
       decodedCount--;
@@ -243,7 +281,7 @@
   }
 
   function attachViewer(img, options = {}) {
-    if (attached.has(img) || !img.parentNode) return null;
+    if (!monitoring || !isSiteAllowed() || attached.has(img) || !img.parentNode) return null;
     attached.add(img);
     img.dataset.gifViewerAttached = "1";
     const originalDisplay = img.style.display;
@@ -255,22 +293,23 @@
     if (initialWidth) wrapper.style.width = `${initialWidth}px`;
     const canvas = document.createElement("canvas");
     canvas.className = "gif-inline-canvas";
-    canvas.setAttribute("aria-label", "GIF / WebP 逐帧预览");
+    canvas.setAttribute("aria-label", tr("viewerLabel"));
     const controls = document.createElement("div");
     controls.className = "gif-inline-controls";
     controls.innerHTML = `
-      <button data-action="first" title="第一帧">|&lt;</button>
-      <button data-action="prev" title="上一帧">&lt;</button>
-      <button class="play" data-action="play" title="播放 / 暂停">▶</button>
-      <button data-action="next" title="下一帧">&gt;</button>
-      <button data-action="last" title="最后一帧">&gt;|</button>
-      <span class="gif-inline-label">读取中…</span>
-      <input class="gif-timeline" type="range" min="0" max="1" value="0" step="1" aria-label="播放进度" title="播放进度" disabled>
-      <label class="gif-loop"><input type="checkbox" checked>循环</label>
-      <label class="gif-speed">速度 <select><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option><option value="4">4×</option></select></label>`;
+      <button data-action="first" title="${tr("first")}">|&lt;</button>
+      <button data-action="prev" title="${tr("previous")}">&lt;</button>
+      <button class="play" data-action="play" title="${tr("playPause")}">▶</button>
+      <button data-action="next" title="${tr("next")}">&gt;</button>
+      <button data-action="last" title="${tr("last")}">&gt;|</button>
+      <span class="gif-inline-label">${tr("loading")}</span>
+      <input class="gif-timeline" type="range" min="0" max="1" value="0" step="1" aria-label="${tr("timeline")}" title="${tr("timeline")}" disabled>
+      <label class="gif-loop"><input type="checkbox" checked>${tr("loop")}</label>
+      <label class="gif-speed">${tr("speed")} <select><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option><option value="4">4×</option></select></label>`;
     img.before(wrapper);
     wrapper.append(canvas, controls);
-    const state = { frames: [], durations: [], frame: 0, playing: false, loop: true, timer: null, speed: 1, width: img.naturalWidth, height: img.naturalHeight, sourceUrl: img.currentSrc || img.src, local: (img.currentSrc || img.src).startsWith("file:"), destroyed: false, cacheEntry: null };
+    const state = { frames: [], durations: [], frame: 0, playing: false, loop: true, timer: null, speed: 1, width: img.naturalWidth, height: img.naturalHeight, sourceUrl: img.currentSrc || img.src, local: (img.currentSrc || img.src).startsWith("file:"), destroyed: false, cacheEntry: null, usesCache: Boolean(options.huaban && options.pinId) };
+    viewers.add(state);
     if (options.huaban && options.pinId) {
       state.cacheEntry = getCacheEntry(options.pinId, state.sourceUrl);
       state.cacheEntry.inUse++;
@@ -287,7 +326,7 @@
       canvas.width = state.width; canvas.height = state.height;
       if (frame instanceof ImageData) context.putImageData(frame, 0, 0);
       else context.drawImage(frame, 0, 0);
-      label.textContent = `${state.kind} · 帧 ${state.frame + 1} / ${state.frames.length}`;
+      label.textContent = `${state.kind} · ${tr("frame")} ${state.frame + 1} / ${state.frames.length}`;
       timeline.value = state.frameTimes?.[state.frame] || 0;
     }
     function setPlaying(playing) {
@@ -384,6 +423,7 @@
       state.releaseCache();
       delete img.dataset.gifViewerAttached;
       attached.delete(img);
+      viewers.delete(state);
       if (activeViewer === state) activeViewer = null;
     };
     canvas.addEventListener("mouseenter", () => { activeViewer = state; });
@@ -403,7 +443,7 @@
     }
     const decoding = state.cacheEntry ? getDecodedEntry(state.cacheEntry) : decodeSource(state.sourceUrl, img.naturalWidth, img.naturalHeight);
     decoding.then((decoded) => {
-      if (state.destroyed) return;
+      if (state.destroyed) { if (!state.usesCache) disposeDecoded(decoded); return; }
       state.frames = decoded.frames;
       state.durations = decoded.durations;
       state.width = decoded.width;
@@ -427,7 +467,7 @@
       if (state.frames.length > 1) setPlaying(true);
     }).catch((error) => {
       if (state.destroyed) return;
-      label.textContent = `无法拆分 (${error.message || "未知错误"})`;
+      label.textContent = `${tr("decodeFailed")} (${error.message || tr("unknownError")})`;
       controls.classList.add("is-error");
       canvas.hidden = true;
       wrapper.hidden = false;
@@ -444,7 +484,7 @@
 
   async function decodeBlob(blob, fallbackWidth = 0, fallbackHeight = 0) {
     const type = /webp/i.test(blob.type) ? "image/webp" : /gif/i.test(blob.type) ? "image/gif" : "";
-    if (!type) throw new Error("未知图片类型");
+    if (!type) throw new Error(tr("unknownType"));
     const state = { frames: [], durations: [], width: fallbackWidth, height: fallbackHeight };
     state.kind = type === "image/webp" ? "WebP" : "GIF";
     if (type === "image/gif" && globalThis.gifuct) {
@@ -458,7 +498,7 @@
         } catch (error) { console.warn("GIF fallback failed", error); }
       }
     }
-    if (typeof ImageDecoder === "undefined") throw new Error("当前 Edge 未提供 ImageDecoder");
+    if (typeof ImageDecoder === "undefined") throw new Error(tr("noDecoder"));
     const decoder = new ImageDecoder({ data: await blob.arrayBuffer(), type });
     const track = await decoder.tracks.ready;
     for (let i = 0; i < track.selectedTrack.frameCount; i++) {
@@ -542,7 +582,7 @@
       if (frame.disposalType === 2) ctx.clearRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
       if (frame.disposalType === 3 && restore) ctx.putImageData(restore, 0, 0);
     });
-    if (!state.frames.length) throw new Error("GIF 没有可显示的帧");
+    if (!state.frames.length) throw new Error(tr("noFrames"));
   }
 
   function loadImageBlob(url) {
@@ -550,7 +590,7 @@
       chrome.runtime.sendMessage({ type: "read-image", url }, (result) => {
         if (!chrome.runtime.lastError && result?.ok) {
           if (result.encoding !== "base64" || typeof result.data !== "string") {
-            reject(new Error("后台返回了无效的图片数据"));
+            reject(new Error(tr("invalidData")));
             return;
           }
           const binary = atob(result.data);
@@ -563,7 +603,7 @@
         fetch(url).then((response) => {
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           return response.blob();
-        }).then(resolve).catch(() => reject(new Error(result?.error || "读取图片失败")));
+        }).then(resolve).catch(() => reject(new Error(result?.error || tr("readFailed"))));
       });
     });
   }
@@ -582,25 +622,88 @@
     }
   });
 
-  scan();
-  window.addEventListener("popstate", scan);
-  window.addEventListener("hashchange", scan);
-  if (IS_HUABAN && globalThis.navigation) globalThis.navigation.addEventListener("currententrychange", scheduleHuabanScan);
-  if (IS_HUABAN && !globalThis.navigation) {
-    let lastUrl = location.href;
-    setInterval(() => {
-      if (location.href === lastUrl) return;
-      lastUrl = location.href;
-      scheduleHuabanScan();
-    }, 1500);
-  }
-  new MutationObserver((records) => {
-    if (IS_HUABAN) {
-      scheduleHuabanScan();
-      return;
+  function clearAllCaches() {
+    for (const entry of resourceCache.values()) {
+      entry.cancelled = true;
+      if (!entry.inUse) disposeDecoded(entry.decoded);
     }
-    records.forEach((record) => record.addedNodes.forEach((node) => { if (node.nodeType === 1) scan(node); }));
-  }).observe(document.documentElement, IS_HUABAN
-    ? { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "srcset"] }
-    : { childList: true, subtree: true });
+    resourceCache.clear();
+  }
+
+  function terminateGifWorker(reason = tr("cancelled")) {
+    if (gifWorker) gifWorker.terminate();
+    gifWorker = null;
+    const error = new Error(reason);
+    for (const request of gifWorkerRequests.values()) request.reject(error);
+    gifWorkerRequests.clear();
+  }
+
+  function startMonitoring() {
+    if (monitoring || !isSiteAllowed()) return;
+    monitoring = true;
+    window.addEventListener("popstate", scan);
+    window.addEventListener("hashchange", scan);
+    if (IS_HUABAN && globalThis.navigation) globalThis.navigation.addEventListener("currententrychange", scheduleHuabanScan);
+    if (IS_HUABAN && !globalThis.navigation) {
+      let lastUrl = location.href;
+      routeFallbackTimer = setInterval(() => {
+        if (location.href === lastUrl) return;
+        lastUrl = location.href;
+        scheduleHuabanScan();
+      }, 1500);
+    }
+    mutationObserver = new MutationObserver((records) => {
+      if (IS_HUABAN) { scheduleHuabanScan(); return; }
+      records.forEach((record) => record.addedNodes.forEach((node) => { if (node.nodeType === 1) scan(node); }));
+    });
+    mutationObserver.observe(document.documentElement, IS_HUABAN
+      ? { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "srcset"] }
+      : { childList: true, subtree: true });
+    scan();
+  }
+
+  function stopMonitoring() {
+    if (!monitoring && !viewers.size && !resourceCache.size && !gifWorker) return;
+    monitoring = false;
+    mutationObserver?.disconnect();
+    mutationObserver = null;
+    window.removeEventListener("popstate", scan);
+    window.removeEventListener("hashchange", scan);
+    if (IS_HUABAN && globalThis.navigation) globalThis.navigation.removeEventListener("currententrychange", scheduleHuabanScan);
+    if (routeFallbackTimer) clearInterval(routeFallbackTimer);
+    routeFallbackTimer = null;
+    if (huabanScanTimer) cancelAnimationFrame(huabanScanTimer);
+    huabanScanTimer = null;
+    if (preloadHandle) {
+      if (preloadIsIdle && typeof cancelIdleCallback === "function") cancelIdleCallback(preloadHandle);
+      else clearTimeout(preloadHandle);
+    }
+    preloadHandle = null;
+    preloadIsIdle = false;
+    for (const viewer of [...viewers]) viewer.destroy();
+    huabanViewer = null;
+    activeViewer = null;
+    clearAllCaches();
+    terminateGifWorker();
+  }
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "sync") return;
+    const wasAllowed = isSiteAllowed();
+    const previousLanguage = currentLanguage();
+    const next = { ...settings };
+    Object.keys(DEFAULT_SETTINGS).forEach((key) => { if (changes[key]) next[key] = changes[key].newValue; });
+    settings = normalizeSettings(next);
+    const allowed = isSiteAllowed();
+    const languageChanged = previousLanguage !== currentLanguage();
+    if (!allowed) stopMonitoring();
+    else if (!wasAllowed) startMonitoring();
+    else if (languageChanged) { stopMonitoring(); startMonitoring(); }
+    else enforceCacheLimits();
+  });
+
+  chrome.storage.sync.get(DEFAULT_SETTINGS, (stored) => {
+    settings = normalizeSettings(stored);
+    if (isSiteAllowed()) startMonitoring();
+  });
 })();

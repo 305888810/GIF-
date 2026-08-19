@@ -1,0 +1,5 @@
+{
+  "extensionName": { "message": "GIF 逐帧查看器" },
+  "extensionDescription": { "message": "逐帧查看 GIF 和动画 WebP，支持播放、跳转、调速和网站控制。" },
+  "actionTitle": { "message": "GIF 逐帧查看器设置" }
+}

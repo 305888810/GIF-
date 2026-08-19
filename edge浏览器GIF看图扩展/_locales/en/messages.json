@@ -1,0 +1,5 @@
+{
+  "extensionName": { "message": "GIF Frame Viewer" },
+  "extensionDescription": { "message": "Frame-by-frame GIF and animated WebP viewer with playback, seeking, speed, and site controls." },
+  "actionTitle": { "message": "GIF Frame Viewer settings" }
+}
