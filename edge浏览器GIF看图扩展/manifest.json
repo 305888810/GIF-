@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "GIF Frame Viewer",
+  "version": "1.7.0",
+  "description": "在网页中逐帧查看 GIF 和动画 WebP，支持暂停、步进和速度控制。",
+  "permissions": [],
+  "host_permissions": ["<all_urls>", "file:///*"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>", "file:///*"],
+      "js": ["vendor/gifuct-js.js", "content.js"],
+      "css": ["viewer.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["gif-worker.js", "vendor/gifuct-js.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_title": "GIF Frame Viewer",
+    "default_icon": {
+      "16": "icons/gif-16.png",
+      "32": "icons/gif-32.png",
+      "48": "icons/gif-48.png",
+      "128": "icons/gif-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/gif-16.png",
+    "32": "icons/gif-32.png",
+    "48": "icons/gif-48.png",
+    "128": "icons/gif-128.png"
+  }
+}
